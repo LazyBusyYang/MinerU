@@ -1,0 +1,122 @@
+# ============================================================
+# MinerU Minimal CUDA Image — Pure uv approach (self-contained venv)
+# Replay WSL uv installation steps INSIDE the container
+# Key fix: After uv venv, COPY the actual Python binary into the venv
+#          so the venv is fully self-contained (no external symlinks)
+# Base: nvidia/cuda:12.1.0-runtime-ubuntu20.04
+# Models: NOT in image — mounted via PVC at /root/.cache/
+# Registry: registry.sensetime.com/zoetrope/mineru
+# ============================================================
+
+FROM nvidia/cuda:12.1.0-runtime-ubuntu20.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV UV_COMPILE_BYTECODE=1
+ARG TEMP_PROXY=""
+
+# ---- Install system deps + uv (same as WSL) ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        wget \
+        git \
+        vim \
+        unzip \
+        gcc \
+        g++ \
+        make \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+        tzdata \
+    && ln -fs /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && dpkg-reconfigure -f noninteractive tzdata \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+RUN if [ -n "$TEMP_PROXY" ]; then \
+        export http_proxy="$TEMP_PROXY" https_proxy="$TEMP_PROXY"; \
+    fi; \
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+# ---- uv python install 3.11 (same as WSL) ----
+RUN /root/.local/bin/uv python install 3.11
+
+# ---- uv venv (same as WSL) ----
+# UV_LINK_MODE=copy: copy files instead of symlinks
+ENV UV_LINK_MODE=copy
+RUN /root/.local/bin/uv venv /opt/venv --python 3.11 && \
+    /opt/venv/bin/python -m ensurepip --upgrade
+
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# ---- Install exactly the exported uv environment package set ----
+COPY temp/uv-env-requirements.txt /tmp/uv-env-requirements.txt
+RUN if [ -n "$TEMP_PROXY" ]; then \
+        export http_proxy="$TEMP_PROXY" https_proxy="$TEMP_PROXY"; \
+    fi; \
+    /root/.local/bin/uv pip install --python /opt/venv/bin/python \
+        --index-url https://download.pytorch.org/whl/cu121 \
+        torch==2.5.1+cu121 \
+        torchvision==0.20.1+cu121 && \
+    sed '/^-e file:\/\//d;/^torch==/d;/^torchvision==/d' /tmp/uv-env-requirements.txt > /tmp/uv-env-requirements.filtered.txt; \
+    /root/.local/bin/uv pip install --python /opt/venv/bin/python \
+        --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+        -r /tmp/uv-env-requirements.filtered.txt
+
+# ---- mineru editable install ----
+# Use pip (not uv) because mineru's pyproject.toml uses dynamic version
+# (version = {attr = "mineru.version.__version__"}) which requires importing
+# the package during build — pip handles this more gracefully than uv
+COPY . /workspace/mineru/
+WORKDIR /workspace/mineru
+RUN /opt/venv/bin/python -m pip install --no-deps -e /workspace/mineru/
+
+## ---- Runtime stage ----
+FROM nvidia/cuda:12.1.0-runtime-ubuntu20.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_NO_CACHE_DIR=1
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV LD_LIBRARY_PATH=/opt/venv/lib/python3.11/site-packages/torch/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+
+# Runtime libs only (OpenCV deps)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+        tzdata \
+        curl \
+        unzip \
+    && ln -fs /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && dpkg-reconfigure -f noninteractive tzdata \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Copy Python runtime and pre-built venv from builder
+COPY --from=builder /root/.local/share/uv/python /root/.local/share/uv/python
+COPY --from=builder /opt/venv /opt/venv
+
+# Copy mineru source
+COPY . /workspace/mineru/
+WORKDIR /workspace/mineru
+
+# Model weights via PVC mount at /root/.cache/
+# Pipeline: OpenDataLab/PDF-Extract-Kit-1___0/  (~14GB)
+# VLM:      OpenDataLab/MinerU2___5-Pro-2604-1___2B/ (~2.2GB)
+
+EXPOSE 8000
+
+ENTRYPOINT ["/opt/venv/bin/python", "-m", "mineru.cli.fast_api"]

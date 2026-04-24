@@ -57,27 +57,25 @@ RUN /root/.local/bin/uv venv /opt/venv --python 3.11 && \
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# ---- Install exactly the exported uv environment package set ----
-COPY temp/uv-env-requirements.txt /tmp/uv-env-requirements.txt
+# ---- Install mineru from pyproject.toml (no temp requirements file) ----
+COPY . /workspace/mineru/
+WORKDIR /workspace/mineru
 RUN if [ -n "$TEMP_PROXY" ]; then \
         export http_proxy="$TEMP_PROXY" https_proxy="$TEMP_PROXY"; \
     fi; \
-    /root/.local/bin/uv pip install --python /opt/venv/bin/python \
-        --index-url https://download.pytorch.org/whl/cu121 \
-        torch==2.5.1+cu121 \
-        torchvision==0.20.1+cu121 && \
-    sed '/^-e file:\/\//d;/^torch==/d;/^torchvision==/d' /tmp/uv-env-requirements.txt > /tmp/uv-env-requirements.filtered.txt; \
-    /root/.local/bin/uv pip install --python /opt/venv/bin/python \
-        --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-        -r /tmp/uv-env-requirements.filtered.txt
+    /root/.local/bin/uv pip install --no-cache --python /opt/venv/bin/python \
+        torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu126
 
-# ---- mineru editable install ----
-# Use pip (not uv) because mineru's pyproject.toml uses dynamic version
-# (version = {attr = "mineru.version.__version__"}) which requires importing
-# the package during build — pip handles this more gracefully than uv
-COPY . /workspace/mineru/
-WORKDIR /workspace/mineru
-RUN /opt/venv/bin/python -m pip install --no-deps -e /workspace/mineru/
+RUN if [ -n "$TEMP_PROXY" ]; then \
+        export http_proxy="$TEMP_PROXY" https_proxy="$TEMP_PROXY"; \
+    fi; \
+    printf "torch==2.6.0\ntorchvision==0.21.0\ntorchaudio==2.6.0\n" > /tmp/constraints.txt; \
+    /root/.local/bin/uv pip install --no-cache --python /opt/venv/bin/python \
+        --index-url https://download.pytorch.org/whl/cu126 \
+        --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+        --index-strategy unsafe-best-match \
+        -c /tmp/constraints.txt \
+        -e "/workspace/mineru[pipeline,vlm]"
 
 ## ---- Runtime stage ----
 FROM nvidia/cuda:12.1.0-runtime-ubuntu20.04 AS runtime
